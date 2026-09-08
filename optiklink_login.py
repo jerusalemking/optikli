@@ -3,6 +3,7 @@
 OptikLink 自动登录脚本 v4.3-fixed（仅必要修复版）
 - 修复 Discord 授权参数（使用硬编码后备值）
 - 增加 /error/vpn 检测
+- 增加 Quick Verification 处理（SeleniumBase UC 模式浏览器过 Turnstile）
 - 保持原始 Dashboard 判断逻辑不变
 - 到期时间自动从页面提取
 """
@@ -196,60 +197,154 @@ def discord_authorize(session, oauth_params):
     
     raise RuntimeError(f"Discord 授权失败 HTTP {r.status_code}")
 
-def optiklink_callback(session, callback_url):
-    """处理回调 - 增加 /error/vpn 检测"""
-    print(f"[C] 回调: {mask_url(callback_url)}")
-    current_url = callback_url
-    
-    # 检查初始URL
-    if '/error/vpn' in current_url:
-        print(f"    ❌ 检测到VPN错误页，登录失败: {current_url}")
-        raise RuntimeError("访问被拦截 (VPN error page)")
-    
-    for i in range(10):
-        # 每次请求前检查当前URL
-        if '/error/vpn' in current_url:
-            print(f"    ❌ 检测到VPN错误页，登录失败: {current_url}")
-            raise RuntimeError("访问被拦截 (VPN error page)")
-        
-        resp = session.get(current_url, timeout=15, headers=HEADERS_BROWSER, allow_redirects=False)
-        print(f"    跳转 #{i+1}: {resp.status_code} → {mask_url(resp.url)}")
-        
-        # 检查响应URL
-        if '/error/vpn' in resp.url:
-            print(f"    ❌ 检测到VPN错误页，登录失败: {resp.url}")
-            raise RuntimeError("访问被拦截 (VPN error page)")
-        
-        if resp.status_code in (301,302,303,307,308):
-            location = resp.headers.get("Location")
-            if not location:
-                raise RuntimeError("无 Location")
-            
-            # 检查即将跳转的目标URL
-            if '/error/vpn' in location:
-                print(f"    ❌ 检测到即将重定向到VPN错误页，登录失败: {location}")
-                raise RuntimeError("访问被拦截 (VPN error page)")
-            
-            if location.startswith("/"):
-                from urllib.parse import urljoin
-                location = urljoin(current_url, location)
-            current_url = location
-            continue
-        if resp.status_code >= 400:
-            raise RuntimeError(f"回调失败 HTTP {resp.status_code}")
-        return
-    raise RuntimeError("重定向过多")
+# ─────────────────────────────────────────────────────────────
+# 浏览器登录 + Quick Verification
+# ─────────────────────────────────────────────────────────────
+# /login?code= 现在会先返回 Quick Verification 页面：随机数学题 + 真实
+# Cloudflare Turnstile（managed 模式，服务端校验 cf-turnstile-response）。
+# 纯 HTTP 造不出令牌；无头浏览器也会被拦（自动化指纹，实测令牌始终为空）。
+# 必须真实有头浏览器 + OS 级鼠标点击，所以这一步用 SeleniumBase UC 模式。
+# math_answer 和 cf-turnstile-response 都正确才会放行。
+# 算式是多操作数链（实测 "2 + 2 + 1"），只取前两个数会把答案算错
+VERIFY_STRONG_RE = re.compile(r'<strong[^>]*>([^<]*)</strong>', re.I)
+VERIFY_TEXT_RE = re.compile(r'What\s+is\s+([0-9+\-×*/÷\s]+?)\s*\?', re.I)
+MATH_TOKEN_RE = re.compile(r'\d+|[+\-×*/÷]')
+TURNSTILE_TOKEN_JS = (
+    'var e=document.querySelector(\'input[name="cf-turnstile-response"]\');'
+    'return e ? String(e.value) : "";'
+)
+MATH_VALUE_JS = (
+    'var e=document.querySelector(\'input[name="math_answer"]\');'
+    'return e ? String(e.value) : "";'
+)
 
-def check_dashboard(session):
-    """Dashboard检测 - 保持原始逻辑不变"""
-    print("[D] Dashboard...")
-    r = session.get("https://optiklink.net", timeout=15, headers=HEADERS_BROWSER, allow_redirects=True)
-    print(f"    状态码: {r.status_code} 最终URL: {mask_url(r.url)}")
+def set_math_answer(sb, answer):
+    """填数学答案并读回确认。
+    update_text 偶尔填不进去，表面看不出——提交后才被服务端判成 wrong_answer。
+    读回不一致就 JS 直设 value 兜底；仍不一致则抛真错误，别等到提交才知道。
+    """
+    want = str(answer)
+    sb.update_text('input[name="math_answer"]', want)
+    got = sb.execute_script(MATH_VALUE_JS)
+    if got != want:
+        js = (
+            'var e=document.querySelector(\'input[name="math_answer"]\');'
+            'e.value="' + want + '";'
+            'e.dispatchEvent(new Event("input",{bubbles:true}));'
+        )
+        sb.execute_script(js)
+        time.sleep(1)
+        got = sb.execute_script(MATH_VALUE_JS)
+    print(f"    答案填入读回: {got}")
+    if got != want:
+        raise RuntimeError(f"数学答案未填入（期望 {want}，实际 {got!r}）")
+
+def sb_proxy():
+    """requests 用的 socks5h:// 换成 Chrome --proxy-server 认识的 socks5://"""
+    return PROXY_URL.replace("socks5h://", "socks5://") or None
+
+def solve_math(a, op, b):
+    a, b = int(a), int(b)
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op in ("*", "×"):
+        return a * b
+    if op in ("/", "÷"):
+        return a // b   # 题面限制 0..100，整除即可
+    raise ValueError(f"未知运算符 {op}")
+
+def read_math_question(html):
+    """取出算式原文。<strong> 整段优先，纯文本兜底。"""
+    m = VERIFY_STRONG_RE.search(html) or VERIFY_TEXT_RE.search(re.sub(r'<[^>]+>', ' ', html))
+    if not m:
+        raise RuntimeError("验证页未找到数学题")
+    return re.sub(r'\s+', ' ', m.group(1)).strip()
+
+def solve_math_expr(expr):
+    """按出现顺序左到右求值：'2 + 2 + 1' → 5。单步运算复用 solve_math。"""
+    tokens = MATH_TOKEN_RE.findall(expr)
+    if len(tokens) < 3 or not tokens[0].isdigit():
+        raise ValueError(f"算式不完整: {expr!r}")
+    acc = int(tokens[0])
+    i = 1
+    while i < len(tokens):
+        if tokens[i].isdigit() or i + 1 >= len(tokens) or not tokens[i + 1].isdigit():
+            raise ValueError(f"算式不完整: {expr!r}")
+        acc = solve_math(acc, tokens[i], int(tokens[i + 1]))
+        i += 2
+    return acc
+
+def browser_login(callback_url):
+    """浏览器打开回调链接、解掉 Quick Verification，返回 (首页HTML, 最终URL)"""
+    try:
+        from seleniumbase import SB
+    except ImportError:
+        raise RuntimeError("缺少 seleniumbase：pip install seleniumbase（并需本机装有 Chrome）")
+    print(f"[C] 浏览器登录: {mask_url(callback_url)}")
+
+    # raise_test_failure=True：test 模式下 SB 默认吞掉块内异常（只打印 traceback），
+    # 真错误会被换成 "cannot unpack non-iterable NoneType object"，TG 报告全是错的。
+    kwargs = {"uc": True, "test": True, "locale": "en", "raise_test_failure": True}
+    proxy = sb_proxy()
+    if proxy:
+        print(f"    代理: {proxy}")
+        kwargs["proxy"] = proxy
+
+    with SB(**kwargs) as sb:
+        sb.uc_open_with_reconnect(callback_url, reconnect_time=5.0)
+        time.sleep(3)
+
+        for attempt in range(1, 4):
+            if not sb.is_element_present('input[name="math_answer"]'):
+                break          # 没有验证页，登录已直接完成
+            print(f"[C2] Quick Verification（第 {attempt} 次）...")
+
+            expr = read_math_question(sb.get_page_source())
+            answer = solve_math_expr(expr)
+            print(f"    题目 {expr} = {answer}")
+
+            set_math_answer(sb, answer)
+            sb.execute_script("document.querySelector('.cf-turnstile').scrollIntoView({block:'center'})")
+            time.sleep(1)
+            sb.uc_gui_click_captcha()
+
+            token = ""
+            for _ in range(10):
+                time.sleep(4)
+                token = sb.execute_script(TURNSTILE_TOKEN_JS)
+                if len(token) > 50:
+                    break
+            if len(token) <= 50:
+                raise RuntimeError("Turnstile 令牌未获取")
+            print(f"    Turnstile 令牌长度 {len(token)}，提交中...")
+            # 错误页把「答案错」和「令牌被拒」混在同一页面，提交前再读一次答案好区分
+            before = sb.execute_script(MATH_VALUE_JS)
+            if before != str(answer):
+                print(f"    ⚠️ 提交前答案已不是 {answer}: {before!r}")
+
+            sb.click('button[type="submit"]')
+            time.sleep(3)
+
+        final_url = sb.get_current_url()
+        print(f"    验证后URL: {mask_url(final_url)}")
+        if '/error/vpn' in final_url:
+            raise RuntimeError("访问被拦截 (VPN error page)")
+        if '/error/' in final_url:
+            raise RuntimeError(f"登录失败: {final_url}")
+
+        sb.open("https://optiklink.net/")
+        sb.wait_for_ready_state_complete()
+        time.sleep(2)
+        return sb.get_page_source(), sb.get_current_url()
+
+def check_dashboard_html(html, final_url):
+    """Dashboard检测 - 判断逻辑保持原始不变"""
     info = {"logged_in": False, "username": "N/A", "expire_date": EXPIRE_DATE_RAW, "running_servers": "N/A"}
-    html = r.text
-    
+
     # 原始判断逻辑
-    if "DASHBOARD" in html.upper() and "/error/" not in r.url:
+    if "DASHBOARD" in html.upper() and "/error/" not in final_url:
         info["logged_in"] = True
         m = re.search(r'Welcome\s+<[^>]+>([^<]+)</[^>]+>\s+to your Dashboard', html, re.I)
         if m:
@@ -360,7 +455,7 @@ def build_report(info, server_result):
 # ─────────────────────────────────────────────────────────────
 def main():
     print("="*55)
-    print("OptikLink 自动登录 v5.0 (单次执行版)")
+    print("OptikLink 自动登录 v6.0 (浏览器过 Turnstile 版)")
     print("="*55)
 
     print("\n========== 开始执行 ==========")
@@ -371,8 +466,9 @@ def main():
     try:
         oauth_params = discover_oauth_params(session)
         callback_url = discord_authorize(session, oauth_params)
-        optiklink_callback(session, callback_url)
-        info = check_dashboard(session)
+        html, final_url = browser_login(callback_url)
+        print(f"[D] Dashboard... 最终URL: {mask_url(final_url)}")
+        info = check_dashboard_html(html, final_url)
         server_result = check_and_start_server(session)
 
         if not info["logged_in"]:
